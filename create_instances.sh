@@ -4,7 +4,7 @@ set -euo pipefail
 ##### === EDITA ESTAS VARIABLES PARA CADA VM ===
 VMID="${VMID:-8100}"                           # ID de la VM
 VMNAME="${VMNAME:-node01}"                     # Nombre de la VM
-ISCSI_STORE="${ISCSI_STORE:-truenas-node01}"   # Storage iSCSI en Proxmox
+ISCSI_STORE="${ISCSI_STORE:-truenas-node01}"   # Storage iSCSI en Proxmox (define portal/iqn)
 LUN="${LUN:-0}"                                # LUN raíz (zvol en TrueNAS)
 
 CLOUD_IMG="${CLOUD_IMG:-/mnt/pve/images/template/iso/noble-server-cloudimg-amd64.img}"
@@ -48,48 +48,74 @@ if [[ -z "${PORTAL}" || -z "${TARGET}" ]]; then
 fi
 echo "==> PORTAL=${PORTAL} TARGET=${TARGET}"
 
-# --- 2) Helpers: by-path y mapper ---
-get_lun_device() {
+# --- 2) Helpers: obtener RUTA PERSISTENTE by-path (NO /dev/sdX), y opcional mapper ---
+get_lun_by_path() {
   local lun="$1"
   local bypath_3260="/dev/disk/by-path/ip-${PORTAL}:3260-iscsi-${TARGET}-lun-${lun}"
   local bypath_nop="/dev/disk/by-path/ip-${PORTAL}-iscsi-${TARGET}-lun-${lun}"
-  if [[ -e "$bypath_3260" ]]; then readlink -f "$bypath_3260"; return 0; fi
-  if [[ -e "$bypath_nop" ]]; then readlink -f "$bypath_nop"; return 0; fi
+  if [[ -e "$bypath_3260" ]]; then echo "$bypath_3260"; return 0; fi
+  if [[ -e "$bypath_nop" ]]; then echo "$bypath_nop"; return 0; fi
   return 1
 }
 get_mapper_name() {
-  local dev="$1"; local base; base="$(basename "$dev")"
+  local dev="$1"; local real base
+  real="$(readlink -f "$dev")" || real="$dev"
+  base="$(basename "$real")"
   if [[ -r "/sys/block/${base}/dm/name" ]]; then
     echo "/dev/mapper/$(cat "/sys/block/${base}/dm/name")"
   else
-    echo "$dev"
+    echo "$dev"   # devolvemos el by-path original si no hay multipath
   fi
 }
 
-# --- 3) Asegurar sesión iSCSI y localizar la LUN ---
-if ! DEV_REAL="$(get_lun_device "${LUN}")"; then
+# --- 3) Asegurar sesión iSCSI y localizar la LUN por by-path ---
+BYPATH="$(get_lun_by_path "${LUN}")" || {
   echo "==> LUN ${LUN} no visible; discovery/login iSCSI…"
   iscsiadm -m discovery -t sendtargets -p "${PORTAL}" || true
   iscsiadm -m node -T "${TARGET}" -p "${PORTAL}:3260" -l || true
   sleep 2
-  DEV_REAL="$(get_lun_device "${LUN}")" || {
+  BYPATH="$(get_lun_by_path "${LUN}")" || {
     echo "No aparece LUN ${LUN}. Revisa export y ACLs en TrueNAS."
     ls -l /dev/disk/by-path/ | grep -E "${TARGET}.*lun-${LUN}" || true
     exit 1
   }
-fi
-DEV_MAPPER="$(get_mapper_name "$DEV_REAL")"
-echo "==> LUN${LUN} real:   ${DEV_REAL}"
-echo "==> LUN${LUN} mapper: ${DEV_MAPPER}"
+}
+REAL_DEV="$(readlink -f "${BYPATH}")"
+ATTACH_DEV="$(get_mapper_name "${BYPATH}")"   # preferimos /dev/mapper si existe; si no, dejamos BYPATH
 
-# --- 4) Volcar cloud-image a la LUN (RAW) ---
+echo "==> LUN${LUN} by-path: ${BYPATH}"
+echo "==> LUN${LUN} real:    ${REAL_DEV}"
+echo "==> LUN${LUN} attach:  ${ATTACH_DEV}"
+
+# Guardas: NO permitir /dev/sdX directo (evita sorpresas al reiniciar)
+if [[ "${ATTACH_DEV}" =~ ^/dev/sd[a-z]+$ ]]; then
+  echo "ERROR: se intentó usar ${ATTACH_DEV}. Adjunta SIEMPRE by-path o /dev/mapper. Abortando."
+  exit 1
+fi
+
+# Evitar CRUZAR LUNs: si BYPATH ya está en alguna VM (distinta de la actual), aborta
+for cfg in /etc/pve/qemu-server/*.conf; do
+  [[ -e "$cfg" ]] || continue
+  if grep -q --fixed-strings "${BYPATH}" "$cfg" || grep -q --fixed-strings "${ATTACH_DEV}" "$cfg"; then
+    if ! grep -q "qm${VMID}\.conf" <<<"$cfg"; then
+      echo "ERROR: El disco ${BYPATH} (${ATTACH_DEV}) ya está referenciado por ${cfg}. Aborto para evitar cruce."
+      exit 1
+    fi
+  fi
+done
+
+# --- 4) Volcar cloud-image a la LUN (RAW) usando RUTA PERSISTENTE ---
 echo "==> qemu-img info ${CLOUD_IMG}"
 qemu-img info "${CLOUD_IMG}" || true
-if mount | grep -q " on ${DEV_MAPPER} "; then
-  echo "ERROR: ${DEV_MAPPER} está montado."; exit 1
+
+# Asegura que no está montado (revisamos real device y mapper si aplica)
+if mount | grep -q " on ${REAL_DEV} "; then echo "ERROR: ${REAL_DEV} está montado."; exit 1; fi
+if [[ "${ATTACH_DEV}" != "${BYPATH}" && "${ATTACH_DEV}" != "${REAL_DEV}" ]]; then
+  if mount | grep -q " on ${ATTACH_DEV} "; then echo "ERROR: ${ATTACH_DEV} está montado."; exit 1; fi
 fi
-echo "==> Volcando cloud-image -> ${DEV_MAPPER} (RAW)…"
-qemu-img convert -p -O raw "${CLOUD_IMG}" "${DEV_MAPPER}"
+
+echo "==> Volcando cloud-image -> ${BYPATH} (RAW)…"
+qemu-img convert -p -O raw "${CLOUD_IMG}" "${BYPATH}"
 sync
 echo "==> Volcado OK."
 
@@ -116,8 +142,8 @@ else
     --net0 "virtio,bridge=${BRIDGE}"
 fi
 
-# Disco raíz por ruta de dispositivo (evita alloc en backend iSCSI)
-qm set "${VMID}" --virtio0 "${DEV_MAPPER},discard=on,cache=writeback,format=raw"
+# Disco raíz con RUTA PERSISTENTE (NO /dev/sdX)
+qm set "${VMID}" --virtio0 "${ATTACH_DEV},discard=on,cache=writeback,format=raw"
 
 # --- 6) Cloud-init: solo USER y META ---
 mkdir -p /var/lib/vz/snippets
@@ -161,7 +187,7 @@ qm set "${VMID}" --ide2 local-lvm:cloudinit
 # Asignar cicustom (user+meta)
 qm set "${VMID}" --cicustom "user=local:snippets/user-${VMID}.yaml,meta=local:snippets/meta-${VMID}.yaml"
 
-# Usuario/clave, red estática y DNS
+# IP estática y DNS
 qm set "${VMID}" --ipconfig0 "ip=${IPADDR},gw=${GATEWAY}" --nameserver "${DNS}"
 
 # (Opcional) además pasa la clave por --sshkey si definiste SSHKEY_PATH
@@ -175,5 +201,5 @@ qm cloudinit update "${VMID}"
 qm stop "${VMID}" >/dev/null 2>&1 || true
 qm start "${VMID}"
 
-echo "==> Listo: VM ${VMID} (${VMNAME}) con root en ${DEV_MAPPER}, IP ${IPADDR}, GW ${GATEWAY}, DNS ${DNS}"
-echo "    Verifica cloud-init con: 'cloud-init status --long' y 'journalctl -u cloud-init -n 200' dentro de la VM."
+echo "==> Listo: VM ${VMID} (${VMNAME}) con root en ${ATTACH_DEV} (by-path: ${BYPATH}), IP ${IPADDR}, GW ${GATEWAY}, DNS ${DNS}"
+echo "    Recuerda: usa SIEMPRE by-path o /dev/mapper. Revisa 'qm config ${VMID}' y verifica que no haya /dev/sdX."
